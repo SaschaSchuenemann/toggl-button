@@ -1,45 +1,36 @@
 /*jslint indent: 2, unparam: true*/
-/*global window: false, XMLHttpRequest: false, chrome: false, btoa: false, localStorage:false */
+/*global window: false, XMLHttpRequest: false, WebSocket: false, chrome: false, btoa: false, localStorage:false */
 "use strict";
 
 var TogglButton = {
   $user: null,
   $curEntry: null,
+  $showPostPopup: true,
   $apiUrl: "https://old.toggl.com/api/v7",
   $newApiUrl: "https://www.toggl.com/api/v8",
-  $sites: new RegExp(
-    [
-      'asana\\.com',
-      'podio\\.com',
-      'trello\\.com',
-      'github\\.com',
-      'bitbucket\\.org',
-      'gitlab\\.com',
-      'redbooth\\.com',
-      'teamweek\\.com',
-      'basecamp\\.com',
-      'unfuddle\\.com',
-      'worksection\\.com',
-      'pivotaltracker\\.com',
-      'producteev\\.com',
-      'sifterapp\\.com',
-      'docs\\.google\\.com',
-      'drive\\.google\\.com',
-      'redmine\\.org',
-      'myjetbrains\\.com',
-      'zendesk\\.com',
-      'capsulecrm\\.com',
-      'web\\.any\\.do',
-      'todoist\\.com',
-      'wunderlist\\.com'
-    ].join('|')
-  ),
+  $sendResponse: null,
+  $socket: null,
+  $retrySocket: false,
+  $socketEnabled: false,
+  $editForm: '<div id="toggl-button-edit-form">' +
+      '<a class="toggl-button {service} active" href="#">Stop timer</a>' +
+      '<p class="toggl-button-row">' +
+        '<label for="toggl-button-description">Description:</label>' +
+        '<input name="toggl-button-description" type="text" id="toggl-button-description" class="toggl-button-input" value="">' +
+      '</p>' +
+      '<p class="toggl-button-row">' +
+        '<label for="toggl-button-project">Project:</label>' +
+        '<select class="toggl-button-input" id="toggl-button-project" name="toggl-button-project">{projects}</select>' +
+      '</p>' +
+      '<p id="toggl-button-submit-row">' +
+        '<input type="button" value="Cancel" id="toggl-button-hide">' +
+        '<input type="button" value="Update" id="toggl-button-update">' +
+      '</p>' +
+    '</div>',
 
   checkUrl: function (tabId, changeInfo, tab) {
     if (changeInfo.status === 'complete') {
-      if (TogglButton.$sites.test(tab.url)) {
-        TogglButton.setPageAction(tabId);
-      } else if (/toggl\.com\/track/.test(tab.url)) {
+      if (/toggl\.com\/track/.test(tab.url)) {
         TogglButton.fetchUser(TogglButton.$apiUrl);
       } else if (/toggl\.com\/app\/index/.test(tab.url)) {
         TogglButton.fetchUser(TogglButton.$newApiUrl);
@@ -60,10 +51,28 @@ var TogglButton = {
               projectMap[project.name] = project;
             });
           }
+          if (resp.data.time_entries) {
+            resp.data.time_entries.some(function (entry) {
+              if (entry.duration < 0) {
+                TogglButton.$curEntry = entry;
+                TogglButton.setBrowserAction(entry);
+                return true;
+              }
+              return false;
+            });
+          }
           TogglButton.$user = resp.data;
           TogglButton.$user.projectMap = projectMap;
           localStorage.removeItem('userToken');
           localStorage.setItem('userToken', resp.data.api_token);
+          if (TogglButton.$sendResponse !== null) {
+            TogglButton.$sendResponse({success: (xhr.status === 200)});
+            TogglButton.$sendResponse = null;
+            TogglButton.setBrowserActionBadge();
+          }
+          if (TogglButton.$socketEnabled) {
+            TogglButton.setupSocket();
+          }
         } else if (apiUrl === TogglButton.$apiUrl) {
           TogglButton.fetchUser(TogglButton.$newApiUrl);
         } else if (apiUrl === TogglButton.$newApiUrl && !token) {
@@ -76,7 +85,78 @@ var TogglButton = {
     });
   },
 
-  createTimeEntry: function (timeEntry) {
+  setupSocket: function () {
+    var authenticationMessage, pingResponse;
+    try {
+      TogglButton.$socket = new WebSocket('wss://stream.toggl.com/ws');
+    } catch (error) {
+      return;
+    }
+
+    authenticationMessage = {
+      type: 'authenticate',
+      api_token: TogglButton.$user.api_token
+    };
+    pingResponse = JSON.stringify({
+      type: "pong"
+    });
+
+    TogglButton.$socket.onopen = function () {
+      var data;
+      data = JSON.stringify(authenticationMessage);
+      try {
+        return TogglButton.$socket.send(data);
+      } catch (error) {
+        console.log("Exception while sending:", error);
+      }
+    };
+
+    TogglButton.$socket.onerror = function (e) {
+      return console.log('onerror: ', e);
+    };
+
+    TogglButton.$socket.onclose = function () {
+      var retrySeconds = Math.floor(Math.random() * 30);
+      if (TogglButton.$retrySocket) {
+        setTimeout(TogglButton.setupSocket, retrySeconds * 1000);
+        TogglButton.$retrySocket = false;
+      }
+    };
+
+    TogglButton.$socket.onmessage = function (msg) {
+      var data;
+      data = JSON.parse(msg.data);
+      if (data.session_id !== null) {
+        console.log("session authenticated, session ID:", data.session_id);
+      } else if (data.model !== null) {
+        if (data.model === "time_entry") {
+          TogglButton.updateCurrentEntry(data);
+        }
+      } else if (TogglButton.$socket !== null) {
+        try {
+          TogglButton.$socket.send(pingResponse);
+        } catch (error) {
+          console.log("Exception while sending:", error);
+        }
+      }
+    };
+
+  },
+
+  updateCurrentEntry: function (data) {
+    var entry = data.data;
+    if (data.action === "INSERT") {
+      TogglButton.$curEntry = entry;
+    } else if (data.action === "UPDATE") {
+      if (entry.duration < 0) {
+        TogglButton.$curEntry = entry;
+      } else {
+        TogglButton.$curEntry = null;
+      }
+    }
+  },
+
+  createTimeEntry: function (timeEntry, sendResponse) {
     var project, start = new Date(),
       entry = {
         time_entry: {
@@ -104,6 +184,10 @@ var TogglButton = {
         responseData = JSON.parse(xhr.responseText);
         entry = responseData && responseData.data;
         TogglButton.$curEntry = entry;
+        TogglButton.setBrowserAction(entry);
+        if (!!timeEntry.respond) {
+          sendResponse({success: (xhr.status === 200), type: "New Entry", entry: entry, showPostPopup: TogglButton.$showPostPopup});
+        }
       }
     });
   },
@@ -112,7 +196,8 @@ var TogglButton = {
     var xhr = new XMLHttpRequest(),
       method = opts.method || 'GET',
       baseUrl = opts.baseUrl || TogglButton.$newApiUrl,
-      token = opts.token || (TogglButton.$user && TogglButton.$user.api_token);
+      token = opts.token || (TogglButton.$user && TogglButton.$user.api_token),
+      credentials = opts.credentials || null;
 
     xhr.open(method, baseUrl + url, true);
     if (opts.onLoad) {
@@ -121,10 +206,13 @@ var TogglButton = {
     if (token && token !== ' ') {
       xhr.setRequestHeader('Authorization', 'Basic ' + btoa(token + ':api_token'));
     }
+    if (credentials) {
+      xhr.setRequestHeader('Authorization', 'Basic ' + btoa(credentials.username + ':' + credentials.password));
+    }
     xhr.send(JSON.stringify(opts.payload));
   },
 
-  stopTimeEntry: function () {
+  stopTimeEntry: function (timeEntry, sendResponse) {
     if (!TogglButton.$curEntry) { return; }
     var stopTime = new Date(),
       startTime = new Date(-TogglButton.$curEntry.duration * 1000);
@@ -136,45 +224,170 @@ var TogglButton = {
           stop: stopTime.toISOString(),
           duration: Math.floor(((stopTime - startTime) / 1000))
         }
+      },
+      onLoad: function (xhr) {
+        if (xhr.status === 200) {
+          TogglButton.$curEntry = null;
+          TogglButton.setBrowserAction(null);
+          if (!!timeEntry.respond) {
+            sendResponse({success: true, type: "Stop"});
+            chrome.tabs.query({active: true, currentWindow: true}, function (tabs) {
+              chrome.tabs.sendMessage(tabs[0].id, {type: "stop-entry"});
+            });
+          }
+        }
       }
     });
   },
 
-  setPageAction: function (tabId) {
-    var imagePath = 'images/inactive-19.png';
-    if (TogglButton.$user !== null) {
-      imagePath = 'images/active-19.png';
+  updateTimeEntry: function (timeEntry, sendResponse) {
+    var entry;
+    if (!TogglButton.$curEntry) { return; }
+    TogglButton.ajax("/time_entries/" + TogglButton.$curEntry.id, {
+      method: 'PUT',
+      payload: {
+        time_entry: {
+          description: timeEntry.description,
+          pid: timeEntry.pid
+        }
+      },
+      onLoad: function (xhr) {
+        var responseData;
+        responseData = JSON.parse(xhr.responseText);
+        entry = responseData && responseData.data;
+        TogglButton.$curEntry = entry;
+        TogglButton.setBrowserAction(entry);
+        if (!!timeEntry.respond) {
+          sendResponse({success: (xhr.status === 200), type: "Update"});
+        }
+      }
+    });
+  },
+
+  setBrowserActionBadge: function () {
+    var badge = "";
+    if (TogglButton.$user === null) {
+      badge = "x";
+      TogglButton.setBrowserAction(null);
     }
-    chrome.pageAction.setIcon({
-      tabId: tabId,
+    chrome.browserAction.setBadgeText(
+      {text: badge}
+    );
+  },
+
+  setBrowserAction: function (runningEntry) {
+    var imagePath = {'19': 'images/inactive-19.png', '38': 'images/inactive-38.png'},
+      title = chrome.runtime.getManifest().browser_action.default_title;
+    if (runningEntry !== null) {
+      imagePath = {'19': 'images/active-19.png', '38': 'images/active-38.png'};
+      title = runningEntry.description + " - Toggl";
+    }
+    chrome.browserAction.setTitle({
+      title: title
+    });
+    chrome.browserAction.setIcon({
       path: imagePath
     });
-    chrome.pageAction.show(tabId);
+  },
+
+  loginUser: function (request, sendResponse) {
+    TogglButton.ajax("/sessions", {
+      method: 'POST',
+      onLoad: function (xhr) {
+        TogglButton.$sendResponse = sendResponse;
+        TogglButton.fetchUser(TogglButton.$newApiUrl);
+        TogglButton.refreshPage();
+      },
+      credentials: {
+        username: request.username,
+        password: request.password
+      }
+    });
+  },
+
+  logoutUser: function (sendResponse) {
+    TogglButton.ajax("/sessions?created_with=TogglButton", {
+      method: 'DELETE',
+      onLoad: function (xhr) {
+        TogglButton.$user = null;
+        sendResponse({success: (xhr.status === 200), xhr: xhr});
+        TogglButton.refreshPage();
+      }
+    });
+  },
+
+  getEditForm: function () {
+    if (TogglButton.$user === null) {
+      return "";
+    }
+    return TogglButton.$editForm.replace("{projects}", TogglButton.fillProjects());
+  },
+
+  fillProjects: function () {
+    var html = "<option value='0'>- No Project -</option>",
+      projects = TogglButton.$user.projectMap,
+      key = null;
+    for (key in projects) {
+      if (projects.hasOwnProperty(key)) {
+        html += "<option value='" + projects[key].id + "'>" + key + "</option>";
+      }
+    }
+    return html;
+  },
+
+  refreshPage: function () {
+    chrome.tabs.query({active: true, currentWindow: true}, function (tabs) {
+      chrome.tabs.reload(tabs[0].id);
+    });
+  },
+
+  setSocket: function (state) {
+    localStorage.setItem("socketEnabled", state);
+    TogglButton.$socketEnabled = state;
+    if (state) {
+      if (TogglButton.$socket !== null) {
+        TogglButton.$socket.close();
+        TogglButton.$socket = null;
+      }
+      TogglButton.setupSocket();
+    } else {
+      TogglButton.$socket.close();
+      TogglButton.$socket = null;
+    }
   },
 
   newMessage: function (request, sender, sendResponse) {
     if (request.type === 'activate') {
-      TogglButton.setPageAction(sender.tab.id);
-      sendResponse({success: TogglButton.$user !== null, user: TogglButton.$user});
+      TogglButton.setBrowserActionBadge();
+      sendResponse({success: TogglButton.$user !== null, user: TogglButton.$user, html: TogglButton.getEditForm()});
+    } else if (request.type === 'login') {
+      TogglButton.loginUser(request, sendResponse);
+    } else if (request.type === 'logout') {
+      TogglButton.logoutUser(sendResponse);
     } else if (request.type === 'timeEntry') {
-      TogglButton.createTimeEntry(request);
+      TogglButton.createTimeEntry(request, sendResponse);
+    } else if (request.type === 'update') {
+      TogglButton.updateTimeEntry(request, sendResponse);
     } else if (request.type === 'stop') {
-      TogglButton.stopTimeEntry();
+      TogglButton.stopTimeEntry(request, sendResponse);
+    } else if (request.type === 'toggle-popup') {
+      localStorage.setItem("showPostPopup", request.state);
+      TogglButton.$showPostPopup = request.state;
+    } else if (request.type === 'toggle-socket') {
+      TogglButton.setSocket(request.state);
     } else if (request.type === 'userToken') {
       if (!TogglButton.$user) {
         TogglButton.fetchUser(TogglButton.$newApiUrl, request.apiToken);
       }
+    } else if (request.type === 'currentEntry') {
+      sendResponse({success: TogglButton.$curEntry !== null, currentEntry: TogglButton.$curEntry});
     }
+    return true;
   }
-
 };
 
-chrome.pageAction.onClicked.addListener(function (tab) {
-  if (TogglButton.$user === null) {
-    chrome.tabs.create({url: 'https://www.toggl.com/#login'});
-  }
-});
-
 TogglButton.fetchUser(TogglButton.$apiUrl);
+TogglButton.$showPostPopup = (localStorage.getItem("showPostPopup") === null) ? true : localStorage.getItem("showPostPopup");
+TogglButton.$socketEnabled = !!localStorage.getItem("socketEnabled");
 chrome.tabs.onUpdated.addListener(TogglButton.checkUrl);
 chrome.extension.onMessage.addListener(TogglButton.newMessage);
